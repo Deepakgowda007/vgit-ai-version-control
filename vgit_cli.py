@@ -1,144 +1,172 @@
 import argparse
 import sys
 import uuid
-# Import everything including the new get_status function
-from vgit_database import initialize_db, add_snapshot, save_vector, query_vectors, get_snapshot_details, get_all_snapshots, get_status
+import vgit_database as db
 
-print("⏳ Loading AI Model...")
+print("⏳ vGit: Loading AI Memory Layer...")
 try:
     from sentence_transformers import SentenceTransformer
     model = SentenceTransformer('all-MiniLM-L6-v2')
-    print("✅ AI Model Loaded.")
 except Exception as e:
-    print(f"❌ Error loading AI model: {e}")
+    print(f"❌ Error: {e}")
     sys.exit(1)
 
 def handle_init(args):
-    """Initialize the VGIT repository."""
-    print("Initializing VGIT...")
-    initialize_db()
+    db.initialize_db()
 
 def handle_snapshot(args):
-    """Capture a new snapshot of code + context."""
     snapshot_id = str(uuid.uuid4())
-    print(f"📸 Snapshotting: {args.message}")
+    print(f"📸 Snapshotting Intent: {args.message} [{args.type}]")
     
-    full_text = f"Prompt: {args.prompt}\nResponse: {args.response}"
-    
-    print("🧠 Generating Vector Embedding...")
-    try:
-        vector = model.encode(full_text).tolist()
-    except Exception as e:
-        print(f"❌ Error generating vector: {e}")
-        return
+    full_text = f"Intent: {args.prompt}\nOutcome: {args.response}"
+    vector = model.encode(full_text).tolist()
 
-    db_success = add_snapshot(snapshot_id, args.message, args.prompt, args.response)
-    vec_success = save_vector(snapshot_id, full_text, vector)
-    
-    if db_success and vec_success:
-        print("🎉 Snapshot Complete! (Metadata + Vector stored)")
-    else:
-        print("❌ Error saving snapshot.")
+    if db.add_snapshot(snapshot_id, args.message, args.prompt, args.response, args.type, 1 if args.stable else 0):
+        db.save_vector(snapshot_id, full_text, vector)
+        status = " (STABLE)" if args.stable else ""
+        print(f"🎉 Captured Iteration {snapshot_id[:8]}{status}")
 
 def handle_ask(args):
-    """Search for past context."""
-    print(f"🔍 Searching for: '{args.query}'")
-    try:
-        query_vec = model.encode(args.query).tolist()
-    except Exception as e:
-        print(f"❌ Error encoding query: {e}")
-        return
-
-    results = query_vectors(query_vec, n_results=3)
+    print(f"🔍 Recalling context for: '{args.query}'")
+    query_vec = model.encode(args.query).tolist()
+    results = db.query_vectors(query_vec)
     
     if not results:
-        print("📭 No relevant snapshots found.")
+        print("📭 No matching memory found.")
         return
 
-    print(f"\n✅ Found {len(results)} relevant snapshots:\n")
-    for snap_id, distance, doc_snippet in results:
-        details = get_snapshot_details(snap_id)
+    print(f"\n✅ Relevant Memories Found:\n")
+    for snap_id, distance, doc in results:
+        details = db.get_snapshot_details(snap_id)
         if details:
-            timestamp, message, prompt, response = details
+            time, msg, _, _, task, stable = details
             score = 1 - distance
-            print(f"------------------------------------------------")
-            print(f"📸 ID: {snap_id[:8]} (Match: {score:.2f})")
-            print(f"📅 Time: {timestamp}")
-            print(f"💬 Message: {message}")
-            print(f"❓ Context: {prompt[:100]}...") 
-            print(f"------------------------------------------------")
+            
+            # --- SAFETY GUARD FOR NULL VALUES ---
+            display_task = (task or "legacy").upper()
+            marker = "⭐ [STABLE]" if stable else ""
+            
+            print(f"[{score:.2f}] {snap_id[:8]} | {time} | {display_task:<8} | {msg} {marker}")
 
 def handle_log(args):
-    """Show commit history."""
-    print("📜 VGIT History:\n")
-    snapshots = get_all_snapshots()
-    
-    if not snapshots:
-        print("📭 No snapshots found in history.")
+    print("📜 vGit Knowledge Log:\n")
+    snaps = db.get_all_snapshots()
+    if not snaps:
+        print("📭 Log is empty.")
         return
 
-    for snap_id, timestamp, message, prompt in snapshots:
-        print(f"🔹 Commit: {snap_id[:8]}")
-        print(f"   Date:   {timestamp}")
-        print(f"   Msg:    {message}")
-        print(f"   Prompt: {prompt[:60]}...")
-        print("")
+    for sid, time, msg, task, stable in snaps:
+        # --- SAFETY GUARD FOR NULL VALUES ---
+        display_task = (task or "legacy").upper()
+        marker = "⭐ STABLE" if stable else "DRAFT"
+        print(f"{sid[:8]} | {time} | {display_task:<8} | {marker:<8} | {msg}")
+
+def handle_explain(args):
+    details = db.get_snapshot_details(args.id)
+    if not details:
+        print("❌ Snapshot not found.")
+        return
+    
+    time, msg, prompt, resp, task, stable = details
+    display_task = (task or "legacy").upper()
+    
+    print(f"\n{'='*20} vGIT EXPLAIN {'='*20}")
+    print(f"Snapshot: {args.id[:8]} ({'STABLE' if stable else 'DRAFT'})")
+    print(f"Goal:     {msg}")
+    print(f"Type:     {display_task}")
+    print(f"Time:     {time}")
+    print(f"\n[USER PROMPT]\n{prompt}")
+    print(f"\n[AGENT RESPONSE]\n{resp[:300]}...")
+    
+    print(f"\n{'='*15} RELATED MEMORIES {'='*15}")
+    vec = model.encode(prompt).tolist()
+    related = db.query_vectors(vec, n_results=3)
+    for rid, dist, _ in related:
+        if rid[:8] != args.id[:8]:
+            print(f" -> {rid[:8]} (Similarity: {1-dist:.2f})")
+    print("="*53)
+
+def handle_diff(args):
+    files1 = set(db.get_manifest_content(args.id1) or [])
+    files2 = set(db.get_manifest_content(args.id2) or [])
+    
+    if not files1 and not files2:
+        print("❌ Could not retrieve manifests. Ensure IDs are correct.")
+        return
+
+    print(f"\n📂 Structural Diff: {args.id1[:8]} -> {args.id2[:8]}")
+    added = files2 - files1
+    removed = files1 - files2
+    
+    if added:
+        print("\n➕ Files Added:")
+        for f in added: print(f"  {f}")
+    if removed:
+        print("\n➖ Files Removed:")
+        for f in removed: print(f"  {f}")
+    if not added and not removed:
+        print("\n✨ No structural changes (File content may have changed).")
 
 def handle_status(args):
-    """Show current repository status."""
-    print("📊 VGIT Status:\n")
-    status = get_status()
-    
-    if status["status"] != "Active":
-        print(f"Status: {status['status']}")
+    s = db.get_status()
+    if not s:
+        print("No snapshots yet.")
         return
+    print(f"📊 Status: {s['total']} tracked files.")
+    if s['new']:
+        print("New (Untracked):")
+        for f in s['new']: print(f" + {f}")
+    if s['deleted']:
+        print("Deleted:")
+        for f in s['deleted']: print(f" - {f}")
+    if not s['new'] and not s['deleted']:
+        print("✨ Working directory clean.")
 
-    print(f"✅ Tracking {status['total_tracked']} files from last snapshot.")
-    
-    if status["new"]:
-        print("\n🆕 New Files (Untracked):")
-        for f in status["new"]:
-            print(f"   + {f}")
-            
-    if status["deleted"]:
-        print("\n❌ Deleted Files:")
-        for f in status["deleted"]:
-            print(f"   - {f}")
-            
-    if not status["new"] and not status["deleted"]:
-        print("\n✨ Working directory clean (No new/deleted files).")
+def handle_resume(args):
+    details = db.get_snapshot_details(args.id)
+    files = db.get_manifest_content(args.id)
+    if not details or not files:
+        print("❌ Invalid snapshot ID.")
+        return
+    print(f"\n🔄 RESUMING {args.id[:8]}\n\nFiles in this state:")
+    for f in files: print(f"  - {f}")
+    print(f"\nCONTEXT:\nPrompt: {details[2]}\nResponse: {details[3]}")
 
 def main():
-    parser = argparse.ArgumentParser(description="VGIT CLI")
-    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+    parser = argparse.ArgumentParser(description="vGit: Agentic Memory Layer")
+    subparsers = parser.add_subparsers(dest="command")
 
-    # init
-    init_parser = subparsers.add_parser("init")
-    init_parser.set_defaults(func=handle_init)
+    subparsers.add_parser("init")
+    
+    snap = subparsers.add_parser("snapshot")
+    snap.add_argument("-m", "--message", required=True)
+    snap.add_argument("-p", "--prompt", required=True)
+    snap.add_argument("-r", "--response", default="")
+    snap.add_argument("--type", choices=['feat', 'bug', 'refactor'], default='feat')
+    snap.add_argument("--stable", action="store_true")
+    snap.set_defaults(func=handle_snapshot)
 
-    # snapshot
-    snap_parser = subparsers.add_parser("snapshot")
-    snap_parser.add_argument("-m", "--message", required=True)
-    snap_parser.add_argument("-p", "--prompt", default="")
-    snap_parser.add_argument("-r", "--response", default="")
-    snap_parser.set_defaults(func=handle_snapshot)
+    subparsers.add_parser("log").set_defaults(func=handle_log)
+    subparsers.add_parser("status").set_defaults(func=handle_status)
+    
+    ask = subparsers.add_parser("ask").add_argument("query")
+    subparsers.choices['ask'].set_defaults(func=handle_ask)
 
-    # ask
-    ask_parser = subparsers.add_parser("ask")
-    ask_parser.add_argument("query")
-    ask_parser.set_defaults(func=handle_ask)
+    exp = subparsers.add_parser("explain").add_argument("id")
+    subparsers.choices['explain'].set_defaults(func=handle_explain)
 
-    # log
-    log_parser = subparsers.add_parser("log", help="Show history")
-    log_parser.set_defaults(func=handle_log)
+    df = subparsers.add_parser("diff")
+    df.add_argument("id1")
+    df.add_argument("id2")
+    df.set_defaults(func=handle_diff)
 
-    # status (NEW)
-    status_parser = subparsers.add_parser("status", help="Show working tree status")
-    status_parser.set_defaults(func=handle_status)
+    res = subparsers.add_parser("resume").add_argument("id")
+    subparsers.choices['resume'].set_defaults(func=handle_resume)
 
     args = parser.parse_args()
     if args.command:
-        args.func(args)
+        if args.command == "init": handle_init(args)
+        elif hasattr(args, 'func'): args.func(args)
     else:
         parser.print_help()
 
